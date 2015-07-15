@@ -27,6 +27,10 @@ const (
 )
 
 var (
+	defaultFontData = draw2d.FontData{"luxi", draw2d.FontFamilySans, draw2d.FontStyleNormal}
+)
+
+var (
 	caps = map[draw2d.Cap]string{
 		draw2d.RoundCap:  "round",
 		draw2d.ButtCap:   "butt",
@@ -80,12 +84,13 @@ func clearRect(gc *GraphicContext, x1, y1, x2, y2 float64) {
 type GraphicContext struct {
 	*draw2d.StackGraphicContext
 	pdf *gofpdf.Fpdf
+	glyphBuf         *truetype.GlyphBuf
 	DPI int
 }
 
 // NewGraphicContext creates a new pdf GraphicContext
 func NewGraphicContext(pdf *gofpdf.Fpdf) *GraphicContext {
-	gc := &GraphicContext{draw2d.NewStackGraphicContext(), pdf, DPI}
+	gc := &GraphicContext{draw2d.NewStackGraphicContext(), pdf, truetype.NewGlyphBuf(), DPI}
 	gc.SetDPI(DPI)
 	return gc
 }
@@ -121,7 +126,7 @@ func (gc *GraphicContext) ClearRect(x1, y1, x2, y2 int) {
 // resolution and font metrics, and invalidates the glyph cache.
 func (gc *GraphicContext) recalc() {
 	// TODO: resolve properly the font size for pdf and bitmap
-	gc.Current.Scale = 3 * float64(gc.DPI) / 72
+	gc.Current.Scale = gc.Current.FontSize * float64(gc.DPI) * (64.0 / 72.0) / 3.0
 }
 
 // SetDPI sets the DPI which influences the font size.
@@ -153,17 +158,89 @@ func (gc *GraphicContext) GetStringBounds(s string) (left, top, right, bottom fl
 	return 0, top, gc.pdf.GetStringWidth(s), top + h
 }
 
+func fUnitsToFloat64(x int32) float64 {
+	scaled := x << 2
+	return float64(scaled/256) + float64(scaled%256)/256.0
+}
+
+// p is a truetype.Point measured in FUnits and positive Y going upwards.
+// The returned value is the same thing measured in floating point and positive Y
+// going downwards.
+func pointToF64Point(p truetype.Point) (x, y float64) {
+	return fUnitsToFloat64(p.X), -fUnitsToFloat64(p.Y)
+}
+
+// drawContour draws the given closed contour at the given sub-pixel offset.
+func (gc *GraphicContext) drawContour(ps []truetype.Point, dx, dy float64) {
+	if len(ps) == 0 {
+		return
+	}
+	startX, startY := pointToF64Point(ps[0])
+	gc.MoveTo(startX+dx, startY+dy)
+	q0X, q0Y, on0 := startX, startY, true
+	for _, p := range ps[1:] {
+		qX, qY := pointToF64Point(p)
+		on := p.Flags&0x01 != 0
+		if on {
+			if on0 {
+				gc.LineTo(qX+dx, qY+dy)
+			} else {
+				gc.QuadCurveTo(q0X+dx, q0Y+dy, qX+dx, qY+dy)
+			}
+		} else {
+			if on0 {
+				// No-op.
+			} else {
+				midX := (q0X + qX) / 2
+				midY := (q0Y + qY) / 2
+				gc.QuadCurveTo(q0X+dx, q0Y+dy, midX+dx, midY+dy)
+			}
+		}
+		q0X, q0Y, on0 = qX, qY, on
+	}
+	// Close the curve.
+	if on0 {
+		gc.LineTo(startX+dx, startY+dy)
+	} else {
+		gc.QuadCurveTo(q0X+dx, q0Y+dy, startX+dx, startY+dy)
+	}
+}
+
+func (gc *GraphicContext) drawGlyph(glyph truetype.Index, dx, dy float64) error {
+	if err := gc.glyphBuf.Load(gc.Current.Font, int32(gc.Current.Scale), glyph, truetype.NoHinting); err != nil {
+		return err
+	}
+	e0 := 0
+	for _, e1 := range gc.glyphBuf.End {
+		gc.drawContour(gc.glyphBuf.Point[e0:e1], dx, dy)
+		e0 = e1
+	}
+	return nil
+}
+
 // CreateStringPath creates a path from the string s at x, y, and returns the string width.
-func (gc *GraphicContext) CreateStringPath(text string, x, y float64) (cursor float64) {
-	//fpdf uses the top left corner
-	left, top, right, bottom := gc.GetStringBounds(text)
-	w := right - left
-	h := bottom - top
-	// gc.pdf.SetXY(x, y-h) do not use this as y-h might be negative
-	margin := gc.pdf.GetCellMargin()
-	gc.pdf.MoveTo(x-left-margin, y+top)
-	gc.pdf.CellFormat(w, h, text, "", 0, "BL", false, 0, "")
-	return w
+func (gc *GraphicContext) CreateStringPath(s string, x, y float64) (cursor float64) {
+	font, err := gc.loadCurrentFont()
+	if err != nil {
+		log.Println(err)
+		return 0.0
+	}
+	startx := x
+	prev, hasPrev := truetype.Index(0), false
+	for _, rune := range s {
+		index := font.Index(rune)
+		if hasPrev {
+			x += fUnitsToFloat64(font.Kerning(int32(gc.Current.Scale), prev, index))
+		}
+		err := gc.drawGlyph(index, x, y)
+		if err != nil {
+			log.Println(err)
+			return startx - x
+		}
+		x += fUnitsToFloat64(font.HMetric(int32(gc.Current.Scale), index).AdvanceWidth)
+		prev, hasPrev = index, true
+	}
+	return x - startx
 }
 
 // FillString draws a string at 0, 0
@@ -173,7 +250,9 @@ func (gc *GraphicContext) FillString(text string) (cursor float64) {
 
 // FillStringAt draws a string at x, y
 func (gc *GraphicContext) FillStringAt(text string, x, y float64) (cursor float64) {
-	return gc.CreateStringPath(text, x, y)
+	width := gc.CreateStringPath(text, x, y)
+	gc.Fill()
+	return width
 }
 
 // StrokeString draws a string at 0, 0 (stroking is unsupported,
@@ -186,6 +265,10 @@ func (gc *GraphicContext) StrokeString(text string) (cursor float64) {
 // string will be filled)
 func (gc *GraphicContext) StrokeStringAt(text string, x, y float64) (cursor float64) {
 	return gc.CreateStringPath(text, x, y)
+}
+
+func (gc *GraphicContext) loadCurrentFont() (*truetype.Font, error) {
+	return gc.Current.Font, nil
 }
 
 // Stroke strokes the paths with the color specified by SetStrokeColor
@@ -258,7 +341,7 @@ func (gc *GraphicContext) SetFillColor(c color.Color) {
 // SetFont is unsupported by the pdf graphic context, use SetFontData
 // instead.
 func (gc *GraphicContext) SetFont(font *truetype.Font) {
-	// TODO: what to do with this api conflict between draw2d and gofpdf?!
+	gc.Current.Font = font
 }
 
 // SetFontData sets the current font used to draw text. Always use
@@ -290,9 +373,8 @@ func (gc *GraphicContext) SetFontData(fontData draw2d.FontData) {
 // SetFontSize sets the font size in points (as in ``a 12 point font'').
 // TODO: resolve this with ImgGraphicContext (now done with gc.Current.Scale)
 func (gc *GraphicContext) SetFontSize(fontSize float64) {
-	gc.StackGraphicContext.SetFontSize(fontSize)
+	gc.Current.FontSize = fontSize
 	gc.recalc()
-	gc.pdf.SetFontSize(fontSize * gc.Current.Scale)
 }
 
 // SetLineDash sets the line dash pattern
